@@ -1,0 +1,17 @@
+{
+  "name": "clash-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "从 GitHub Pages 拉配置模板，并注入代理节点的 Cloudflare Worker",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.151.1"
+  }
+}
