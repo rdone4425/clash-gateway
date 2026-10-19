@@ -86,8 +86,9 @@ export default {
         case "/health":
           return json({ status: "ok", version: VERSION });
         case "/sub":
-        case "/stash":
           return await handleSub(request, env);
+        case "/stash":
+          return await handleSub(request, env, "stash");
         case "/provider":
           return await handleProvider(request, env, ctx);
         default:
@@ -224,7 +225,7 @@ async function handleProfileSub(request, env, id) {
 
   const { config } = await fetchConfig(profile.config || env.CONFIG_URL, env);
   rewriteRuleProviders(config, publicBase(request, env));
-  applyPersonalRules(config, publicBase(request, env));
+  await applyPersonalRules(config, env, publicBase(request, env));
   applyProvider(config, `${publicBase(request, env)}/provider/${id}`, env);
 
   return configResponse(await resolveProfileName(env), env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
@@ -339,10 +340,11 @@ function isPrivateHost(hostname) {
 
 /* ------------------------------ 固定订阅模式 ------------------------------ */
 
-async function handleSub(request, env) {
+async function handleSub(request, env, targetOverride) {
   requireToken(request, env);
 
   const token = providedToken(request);
+  const target = targetOverride || "clash";
   const settings = await loadSettings(env);
 
   // 每次订阅更新时，顺手把机场节点刷新进 KV
@@ -360,7 +362,21 @@ async function handleSub(request, env) {
   );
 
   rewriteRuleProviders(config, publicBase(request, env));
-  applyPersonalRules(config, publicBase(request, env));
+  await applyPersonalRules(config, env, publicBase(request, env), { asRules: target === "stash" });
+
+  if (target === "stash") {
+    // Stash 不支持 mrs / classical：geosite 转为 yaml 文本规则集，移除 expected-status
+    for (const provider of Object.values(config["rule-providers"] || {})) {
+      if (!provider || typeof provider.url !== "string") continue;
+      if (provider.url.endsWith(".mrs")) {
+        provider.url = provider.url.replace(/\.mrs$/, ".list?format=yaml");
+        provider.format = "yaml";
+      }
+    }
+    for (const group of config["proxy-groups"] || []) {
+      if (group && group["expected-status"] !== undefined) delete group["expected-status"];
+    }
+  }
 
   if (nodes?.proxies?.length) {
     applyInlineNodes(config, nodes.proxies);
@@ -559,7 +575,7 @@ function rewriteRuleProviders(config, base) {
  * 个人规则库：仓库里的 rules/*.list 生成独立 rule-provider，置顶引用。
  * 加域名只需要编辑 list 文件 push，不用动配置模板。
  */
-function applyPersonalRules(config, base) {
+async function applyPersonalRules(config, env, base, options = {}) {
   const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
   const proxyName = ruleFetchProxy(config);
   const providers = config["rule-providers"] || (config["rule-providers"] = {});
@@ -569,6 +585,22 @@ function applyPersonalRules(config, base) {
     { provider: "personal-ai", file: "personal-ai.list", group: "🤖 AI 服务" },
     { provider: "personal-direct", file: "personal-direct.list", group: "🎯 全球直连" },
   ];
+
+  if (options.asRules) {
+    // Stash 不支持 classical 规则集：个人规则展开为普通规则置于顶部
+    for (const set of personalSets) {
+      const target = groups.find((g) => g && g.name === set.group)?.name || "DIRECT";
+      try {
+        const text = await fetchPersonalList(env, set.file);
+        const ruleLines = parsePersonalList(text).map((line) => `${line},${target}`);
+        rules.unshift(...ruleLines);
+      } catch (error) {
+        console.error(JSON.stringify({ level: "warn", message: `个人规则 ${set.file} 加载失败`, error: error.message }));
+      }
+    }
+    config.rules = rules;
+    return;
+  }
 
   for (const set of personalSets) {
     const target = groups.find((g) => g && g.name === set.group)?.name || "DIRECT";
@@ -587,6 +619,23 @@ function applyPersonalRules(config, base) {
   }
 
   config.rules = rules;
+}
+
+async function fetchPersonalList(env, file) {
+  const listBase = (env.PERSONAL_RULES_URL || DEFAULT_PERSONAL_RULES_URL).replace(/[^/]*$/, "");
+  const response = await fetch(listBase + file, {
+    headers: { "user-agent": `clash-gateway/${VERSION}`, accept: "text/plain" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
+}
+
+function parsePersonalList(text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
 }
 
 /**
@@ -658,16 +707,22 @@ function applyRegionGroups(config, nodes) {
 }
 
 async function handleRule(request, env, ctx, file) {
+  const format = new URL(request.url).searchParams.get("format");
   if (!/^[A-Za-z0-9!_.-]+$/.test(file)) {
     throw new HttpError(404, "规则不存在");
   }
 
   let upstream;
   let ttl;
+  let transform;
   if (/^personal-[a-z0-9-]+\.list$/.test(file)) {
     const listBase = (env.PERSONAL_RULES_URL || DEFAULT_PERSONAL_RULES_URL).replace(/[^/]*$/, "");
     upstream = listBase + file;
     ttl = 300;
+  } else if (/\.list$/.test(file)) {
+    upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
+    ttl = 86400;
+    transform = "stash-yaml";
   } else if (/\.mrs$/.test(file)) {
     upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
     ttl = 86400;
@@ -694,8 +749,20 @@ async function handleRule(request, env, ctx, file) {
   }
   if (!response.ok) throw new HttpError(502, `规则下载失败：HTTP ${response.status}`);
 
-  const body = await response.arrayBuffer();
-  const contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
+  let body;
+  let contentType;
+  if (transform === "stash-yaml" && format === "yaml") {
+    const text = await response.text();
+    const entries = String(text)
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    body = ["payload:", ...entries.map((entry) => `  - ${entry}`)].join("\n");
+    contentType = "text/yaml; charset=utf-8";
+  } else {
+    body = await response.arrayBuffer();
+    contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
+  }
   const output = new Response(body, {
     headers: {
       "content-type": contentType,
