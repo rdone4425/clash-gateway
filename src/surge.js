@@ -13,6 +13,10 @@ function bool(value) {
   return value ? "true" : "false";
 }
 
+function surgeLine(parts) {
+  return `${parts[0]} = ${parts.slice(1).join(", ")}`;
+}
+
 function proxyToSurgeLine(proxy) {
   const { name, server, port } = proxy;
 
@@ -23,7 +27,7 @@ function proxyToSurgeLine(proxy) {
         parts.push(`obfs=${proxy["plugin-opts"]?.mode || "http"}`);
         if (proxy["plugin-opts"]?.host) parts.push(`obfs-host=${proxy["plugin-opts"].host}`);
       }
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "vmess": {
       if (proxy.network === "grpc") return `# 跳过 ${name}：Surge 暂不支持 vmess grpc`;
@@ -37,7 +41,7 @@ function proxyToSurgeLine(proxy) {
       const sni = proxy.servername || proxy.sni;
       if (sni) parts.push(`sni=${sni}`);
       if (proxy["skip-cert-verify"]) parts.push("skip-cert-verify=true");
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "trojan": {
       const parts = [name, "trojan", server, port, `password=${q(proxy.password)}`, "udp-relay=true"];
@@ -48,14 +52,14 @@ function proxyToSurgeLine(proxy) {
         parts.push("ws=true");
         if (proxy["ws-opts"].path) parts.push(`ws-path=${proxy["ws-opts"].path}`);
       }
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "hysteria2": {
       const parts = [name, "hysteria2", server, port, `password=${q(proxy.password)}`];
       const sni = proxy.sni || proxy.servername;
       if (sni) parts.push(`sni=${sni}`);
       if (proxy["skip-cert-verify"]) parts.push("skip-cert-verify=true");
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "vless": {
       if (proxy["reality-opts"]) return `# 跳过 ${name}：Surge 的 REALITY 参数请手动补充`;
@@ -64,19 +68,19 @@ function proxyToSurgeLine(proxy) {
       const sni = proxy.servername || proxy.sni;
       if (sni) parts.push(`sni=${sni}`);
       if (proxy["skip-cert-verify"]) parts.push("skip-cert-verify=true");
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "socks5": {
       const parts = [name, "socks5", server, port];
       if (proxy.username) parts.push(`username=${proxy.username}`, `password=${q(proxy.password)}`);
       parts.push("udp-relay=true");
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     case "http": {
       const parts = [name, proxy.tls ? "https" : "http", server, port];
       if (proxy.username) parts.push(`username=${proxy.username}`, `password=${q(proxy.password)}`);
       if (proxy["skip-cert-verify"]) parts.push(`skip-cert-verify=${bool(proxy["skip-cert-verify"])}`);
-      return parts.join(", ");
+      return surgeLine(parts);
     }
     default:
       return `# 跳过 ${name}：Surge 不支持 ${proxy.type}`;
@@ -104,7 +108,7 @@ function groupToSurge(group, available) {
       parts.push(`strategy=${group.strategy === "round-robin" ? "round-robin" : "pcc"}`);
     }
   }
-  return parts.join(", ");
+  return surgeLine(parts);
 }
 
 function ruleToSurge(rule, providers, base, available) {
