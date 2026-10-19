@@ -9,6 +9,8 @@ const MAX_TTL = 3600;
 const ID_PATTERN = /^[a-f0-9]{32}$/;
 const SETTINGS_KEY = "settings:global";
 const NODES_KEY = "nodes:global";
+const DEFAULT_PERSONAL_RULES_URL =
+  "https://rdone4425.github.io/clash-configs/configs/rules/personal-direct.list";
 
 const CORS = {
   "access-control-allow-origin": "*",
@@ -210,6 +212,7 @@ async function handleProfileSub(request, env, id) {
 
   const { config } = await fetchConfig(profile.config || env.CONFIG_URL, env);
   rewriteRuleProviders(config, publicBase(request, env));
+  applyPersonalRules(config, publicBase(request, env));
   applyProvider(config, `${publicBase(request, env)}/provider/${id}`, env);
 
   return yamlResponse(stringifyYaml(config, { lineWidth: 0 }), {
@@ -345,6 +348,7 @@ async function handleSub(request, env) {
   );
 
   rewriteRuleProviders(config, publicBase(request, env));
+  applyPersonalRules(config, publicBase(request, env));
 
   if (nodes?.proxies?.length) {
     applyInlineNodes(config, nodes.proxies);
@@ -480,14 +484,17 @@ async function fetchConfig(configUrl, env) {
 /**
  * 把 jsdelivr 的 mrs 规则地址换成 Worker 自己的 /rules/，避开核心直连失败。
  */
+function ruleFetchProxy(config) {
+  const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
+  const main = groups.find((g) => g && g.name === "🚀 节点选择") || groups.find((g) => g && g.type === "select");
+  return main ? main.name : "DIRECT";
+}
+
 function rewriteRuleProviders(config, base) {
   const providers = config["rule-providers"];
   if (!providers || typeof providers !== "object") return;
 
-  const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
-  const main = groups.find((g) => g && g.name === "🚀 节点选择") || groups.find((g) => g && g.type === "select");
-  const proxyName = main ? main.name : "DIRECT";
-
+  const proxyName = ruleFetchProxy(config);
   const prefix = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/";
   for (const provider of Object.values(providers)) {
     if (!provider || typeof provider.url !== "string") continue;
@@ -499,8 +506,46 @@ function rewriteRuleProviders(config, base) {
   }
 }
 
+/**
+ * 个人规则库：仓库里的 rules/*.list 生成独立 rule-provider，置顶引用。
+ * 加域名只需要编辑 list 文件 push，不用动配置模板。
+ */
+function applyPersonalRules(config, base) {
+  const providers = config["rule-providers"] || (config["rule-providers"] = {});
+  providers["personal-direct"] = {
+    type: "http",
+    behavior: "classical",
+    format: "text",
+    url: `${base}/rules/personal-direct.list`,
+    path: "./ruleset/personal-direct.list",
+    interval: 1800,
+    proxy: ruleFetchProxy(config),
+  };
+
+  const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
+  const direct = groups.find((g) => g && g.name === "🎯 全球直连");
+  const target = direct ? direct.name : "DIRECT";
+
+  const rules = Array.isArray(config.rules) ? config.rules : [];
+  if (!rules.some((rule) => typeof rule === "string" && rule.startsWith("RULE-SET,personal-direct,"))) {
+    config.rules = [`RULE-SET,personal-direct,${target}`, ...rules];
+  }
+}
+
 async function handleRule(request, env, ctx, file) {
-  if (!/^[A-Za-z0-9!_.-]+\.mrs$/.test(file)) {
+  if (!/^[A-Za-z0-9!_.-]+$/.test(file)) {
+    throw new HttpError(404, "规则不存在");
+  }
+
+  let upstream;
+  let ttl;
+  if (file === "personal-direct.list") {
+    upstream = env.PERSONAL_RULES_URL || DEFAULT_PERSONAL_RULES_URL;
+    ttl = 300;
+  } else if (/\.mrs$/.test(file)) {
+    upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
+    ttl = 86400;
+  } else {
     throw new HttpError(404, "规则不存在");
   }
 
@@ -511,7 +556,6 @@ async function handleRule(request, env, ctx, file) {
     if (hit) return hit;
   }
 
-  const upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
   let response;
   try {
     response = await fetch(upstream, {
@@ -525,10 +569,11 @@ async function handleRule(request, env, ctx, file) {
   if (!response.ok) throw new HttpError(502, `规则下载失败：HTTP ${response.status}`);
 
   const body = await response.arrayBuffer();
+  const contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
   const output = new Response(body, {
     headers: {
-      "content-type": "application/octet-stream",
-      "cache-control": "public, max-age=86400",
+      "content-type": contentType,
+      "cache-control": `public, max-age=${ttl}`,
       "access-control-allow-origin": "*",
       "x-rule-name": file,
     },
