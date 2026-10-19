@@ -313,18 +313,20 @@ function parseShadowsocks(uri) {
     const pluginName = (rawName || "").toLowerCase();
     if (pluginName === "obfs-local" || pluginName === "simple-obfs") {
       proxy.plugin = "obfs";
-      proxy["plugin-opts"] = {
-        mode: map.get("obfs") || "http",
-        host: map.get("obfs-host") || map.get("host") || "",
-      };
+      const obfsHost = map.get("obfs-host") || map.get("host") || "";
+      proxy["plugin-opts"] = obfsHost
+        ? { mode: map.get("obfs") || "http", host: obfsHost }
+        : { mode: map.get("obfs") || "http" };
     } else if (pluginName === "v2ray-plugin") {
       proxy.plugin = "v2ray-plugin";
-      proxy["plugin-opts"] = {
+      const pluginHost = map.get("host") || "";
+      const pluginOpts = {
         mode: map.get("mode") || "websocket",
-        host: map.get("host") || "",
         path: map.get("path") || "/",
         tls: map.get("tls") === "true",
       };
+      if (pluginHost) pluginOpts.host = pluginHost;
+      proxy["plugin-opts"] = pluginOpts;
     }
   }
 

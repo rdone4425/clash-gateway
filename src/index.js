@@ -470,6 +470,17 @@ async function refreshNodes(env) {
     node.name = times === 0 ? base : `${base} ${times + 1}`;
   }
 
+  // 防御：清理 plugin-opts 里的空值（如空的 v2ray-plugin sni 会导致内核拒绝启动）
+  for (const node of unique) {
+    const opts = node["plugin-opts"];
+    if (opts && typeof opts === "object") {
+      for (const key of Object.keys(opts)) {
+        if (opts[key] === "") delete opts[key];
+      }
+      if (Object.keys(opts).length === 0) delete node["plugin-opts"], delete node.plugin;
+    }
+  }
+
   const record = {
     proxies: unique,
     count: unique.length,
