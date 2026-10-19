@@ -484,6 +484,10 @@ function rewriteRuleProviders(config, base) {
   const providers = config["rule-providers"];
   if (!providers || typeof providers !== "object") return;
 
+  const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
+  const main = groups.find((g) => g && g.name === "🚀 节点选择") || groups.find((g) => g && g.type === "select");
+  const proxyName = main ? main.name : "DIRECT";
+
   const prefix = "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/";
   for (const provider of Object.values(providers)) {
     if (!provider || typeof provider.url !== "string") continue;
@@ -491,7 +495,7 @@ function rewriteRuleProviders(config, base) {
     const file = provider.url.slice(prefix.length);
     if (!/^[A-Za-z0-9!_.-]+\.mrs$/.test(file)) continue;
     provider.url = `${base}/rules/${file}`;
-    provider.proxy = "DIRECT";
+    provider.proxy = proxyName;
   }
 }
 
