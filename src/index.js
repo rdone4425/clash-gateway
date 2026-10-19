@@ -371,6 +371,7 @@ async function handleSub(request, env, targetOverride) {
       if (provider.url.endsWith(".mrs")) {
         provider.url = provider.url.replace(/\.mrs$/, ".list?format=yaml");
         provider.format = "yaml";
+        if (typeof provider.path === "string") provider.path = provider.path.replace(/\.mrs$/, ".yaml");
       }
     }
     for (const group of config["proxy-groups"] || []) {
