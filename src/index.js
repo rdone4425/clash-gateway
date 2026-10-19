@@ -1,5 +1,6 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseSubscription } from "./parser.js";
+import qrcode from "qrcode-generator";
 
 const VERSION = "1.1.0";
 const DEFAULT_CONFIG_URL =
@@ -85,6 +86,8 @@ export default {
           return html(infoPage(env, request));
         case "/health":
           return json({ status: "ok", version: VERSION });
+        case "/qr":
+          return await handleQr(request, env);
         case "/sub":
           return await handleSub(request, env);
         case "/stash":
@@ -339,6 +342,29 @@ function isPrivateHost(hostname) {
 }
 
 /* ------------------------------ 固定订阅模式 ------------------------------ */
+
+async function handleQr(request, env) {
+  requireToken(request, env);
+
+  const url = new URL(request.url);
+  const token = providedToken(request);
+  const client = url.searchParams.get("client") === "stash" ? "stash" : "clash";
+  const target = client === "stash" ? "/stash" : "/sub";
+  const text = `${url.origin}${target}?token=${encodeURIComponent(token)}`;
+
+  const qr = qrcode(0, "M");
+  qr.addData(text);
+  qr.make();
+  const svg = qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true });
+
+  return new Response(svg, {
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "no-store",
+      ...CORS,
+    },
+  });
+}
 
 async function handleSub(request, env, targetOverride) {
   requireToken(request, env);
@@ -1005,7 +1031,7 @@ function html(body) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'",
     },
   });
 }
@@ -1033,6 +1059,8 @@ function infoPage(env, request) {
   .hint{font-size:12px;color:#5d6a80;margin:6px 0 0}
   input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #2a3546;border-radius:9px;background:#0b101b;color:#e8edf7;font:inherit;font-size:13px}
   textarea{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #2a3546;border-radius:9px;background:#0b101b;color:#e8edf7;font:inherit;font-size:13px;resize:vertical}
+  select{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #2a3546;border-radius:9px;background:#0b101b;color:#e8edf7;font:inherit;font-size:13px}
+  #qr-img{width:220px;height:220px;background:#fff;padding:8px;border-radius:10px;display:block}
   input:focus{outline:none;border-color:#7c5cff}
   .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
   button{padding:8px 16px;border:1px solid transparent;border-radius:9px;background:linear-gradient(110deg,#7c5cff,#4f8cff 60%,#22d3ee);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
@@ -1071,9 +1099,17 @@ function infoPage(env, request) {
     <div class="status" id="status"></div>
     <div class="status" id="nodes-status"></div>
     <div class="result" id="result" hidden>
+      <label for="client">客户端</label>
+      <select id="client">
+        <option value="clash">Clash / Mihomo / Verge</option>
+        <option value="stash">Stash</option>
+      </select>
       <a id="sub-link" target="_blank" rel="noreferrer"></a>
-      <div class="row"><button id="copy" class="ghost" type="button">复制订阅地址</button></div>
-      <p class="hint">Clash / Stash（Mihomo）：同上 /sub 链接</p>
+      <div class="row">
+        <button id="copy" class="ghost" type="button">复制订阅地址</button>
+        <button id="qr-toggle" class="ghost" type="button">显示二维码</button>
+      </div>
+      <div id="qr-box" hidden><img id="qr-img" alt="订阅二维码"></div>
     </div>
   </div>
 
@@ -1098,6 +1134,10 @@ function infoPage(env, request) {
   var refreshButton = document.getElementById("refresh");
   var result = document.getElementById("result");
   var subLink = document.getElementById("sub-link");
+  var clientSelect = document.getElementById("client");
+  var qrToggle = document.getElementById("qr-toggle");
+  var qrBox = document.getElementById("qr-box");
+  var qrImg = document.getElementById("qr-img");
   var saveButton = document.getElementById("save");
 
   function setStatus(message, kind) {
@@ -1105,11 +1145,18 @@ function infoPage(env, request) {
     statusBox.className = "status" + (kind ? " " + kind : "");
   }
 
-  function showSub(token) {
-    if (!token) return;
-    var sub = location.origin + "/sub?token=" + encodeURIComponent(token);
+  function updateSub(token) {
+    var path = clientSelect.value === "stash" ? "/stash" : "/sub";
+    var sub = location.origin + path + "?token=" + encodeURIComponent(token);
     subLink.textContent = sub;
     subLink.href = sub;
+  }
+
+  function showSub(token) {
+    if (!token) return;
+    updateSub(token);
+    qrImg.src = location.origin + "/qr?token=" + encodeURIComponent(token) + "&client=" + clientSelect.value;
+    qrBox.hidden = false;
     result.hidden = false;
   }
 
@@ -1211,6 +1258,13 @@ function infoPage(env, request) {
   }
 
   saveButton.addEventListener("click", save);
+  clientSelect.addEventListener("change", function () {
+    if (token()) showSub(token());
+  });
+  qrToggle.addEventListener("click", function () {
+    qrBox.hidden = !qrBox.hidden;
+    qrToggle.textContent = qrBox.hidden ? "显示二维码" : "隐藏二维码";
+  });
   document.getElementById("load").addEventListener("click", load);
   refreshButton.addEventListener("click", refreshNodesNow);
   document.getElementById("clear").addEventListener("click", clear);
