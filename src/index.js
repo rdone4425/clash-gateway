@@ -770,11 +770,11 @@ async function resolveProfileName(env, settings) {
 
 function yamlResponse(name, env, body, extraHeaders = {}) {
   const label = (name || env?.PROFILE_NAME || "Clash 网关订阅").trim() || "Clash 网关订阅";
-  const encoded = encodeURIComponent(`${label}.yaml`);
+  const encoded = encodeURIComponent(label);
   return new Response(body, {
     headers: {
       "content-type": "text/yaml; charset=utf-8",
-      "content-disposition": `attachment; filename="clash-gateway.yaml"; filename*=UTF-8''${encoded}`,
+      "content-disposition": `attachment; filename="clash-gateway"; filename*=UTF-8''${encoded}`,
       "profile-update-interval": "1",
       "cache-control": "no-store",
       ...CORS,
