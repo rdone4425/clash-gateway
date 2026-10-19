@@ -133,6 +133,7 @@ async function handleGetSettings(request, env) {
   return json({
     config: settings?.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
     url: settings?.url || "",
+    name: await resolveProfileName(env, settings),
     updatedAt: settings?.updatedAt || null,
     nodes: nodes ? { count: nodes.count, updatedAt: nodes.updatedAt } : null,
   });
@@ -145,14 +146,15 @@ async function handleSaveSettings(request, env) {
   const body = await readJson(request);
   const subscriptionUrl = normalizeSubscriptionUrl(body.url);
   const configUrl = normalizeConfigUrl(body.config, env);
+  const name = typeof body.name === "string" ? body.name.trim().slice(0, 60) : "";
   const updatedAt = new Date().toISOString();
 
   await env.PROFILES.put(
     SETTINGS_KEY,
-    JSON.stringify({ url: subscriptionUrl, config: configUrl, updatedAt }),
+    JSON.stringify({ url: subscriptionUrl, config: configUrl, name, updatedAt }),
   );
 
-  return json({ ok: true, config: configUrl, url: subscriptionUrl, updatedAt });
+  return json({ ok: true, config: configUrl, url: subscriptionUrl, name: name || undefined, updatedAt });
 }
 
 async function handleDeleteSettings(request, env) {
@@ -215,7 +217,7 @@ async function handleProfileSub(request, env, id) {
   applyPersonalRules(config, publicBase(request, env));
   applyProvider(config, `${publicBase(request, env)}/provider/${id}`, env);
 
-  return yamlResponse(env, stringifyYaml(config, { lineWidth: 0 }), {
+  return yamlResponse(await resolveProfileName(env), env, stringifyYaml(config, { lineWidth: 0 }), {
     "x-config-source": profile.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
   });
 }
@@ -357,7 +359,7 @@ async function handleSub(request, env) {
     applyProvider(config, providerUrl, env);
   }
 
-  return yamlResponse(env, stringifyYaml(config, { lineWidth: 0 }), {
+  return yamlResponse(await resolveProfileName(env, settings), env, stringifyYaml(config, { lineWidth: 0 }), {
     "x-config-source": configUrl,
     "x-node-count": String(nodes?.proxies?.length || 0),
   });
@@ -761,9 +763,14 @@ function getCache() {
   }
 }
 
-function yamlResponse(env, body, extraHeaders = {}) {
-  const name = env?.PROFILE_NAME || "Clash 网关订阅";
-  const encoded = encodeURIComponent(`${name}.yaml`);
+async function resolveProfileName(env, settings) {
+  const s = settings || (await loadSettings(env));
+  return (s?.name || env?.PROFILE_NAME || "Clash 网关订阅").trim() || "Clash 网关订阅";
+}
+
+function yamlResponse(name, env, body, extraHeaders = {}) {
+  const label = (name || env?.PROFILE_NAME || "Clash 网关订阅").trim() || "Clash 网关订阅";
+  const encoded = encodeURIComponent(`${label}.yaml`);
   return new Response(body, {
     headers: {
       "content-type": "text/yaml; charset=utf-8",
@@ -846,6 +853,8 @@ function infoPage(env, request) {
     <input id="config" type="url" value="${escapeHtml(configUrl)}" placeholder="https://.../clash-remote.yaml">
     <label for="url">机场订阅链接</label>
     <input id="url" type="url" placeholder="https://example.com/api/v1/client/subscribe?token=...">
+    <label for="pname">订阅名字（导入 Clash 时显示）</label>
+    <input id="pname" type="text" placeholder="Clash 网关订阅">
     <div class="row">
       <button id="save" type="submit">保存</button>
       <button id="load" class="ghost" type="button">读取当前设置</button>
@@ -875,6 +884,7 @@ function infoPage(env, request) {
   var tokenInput = document.getElementById("token");
   var configInput = document.getElementById("config");
   var urlInput = document.getElementById("url");
+  var nameInput = document.getElementById("pname");
   var statusBox = document.getElementById("status");
   var nodesStatus = document.getElementById("nodes-status");
   var refreshButton = document.getElementById("refresh");
@@ -936,6 +946,7 @@ function infoPage(env, request) {
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
       configInput.value = data.config || "";
       urlInput.value = data.url || "";
+      nameInput.value = data.name || "";
       localStorage.setItem("clash-gateway-token", token());
       showSub(token());
       showNodes(data.nodes);
@@ -953,7 +964,7 @@ function infoPage(env, request) {
       var response = await fetch("/api/settings", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer " + token() },
-        body: JSON.stringify({ config: configInput.value.trim(), url: urlInput.value.trim() }),
+        body: JSON.stringify({ config: configInput.value.trim(), url: urlInput.value.trim(), name: nameInput.value.trim() }),
       });
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
