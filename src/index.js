@@ -215,7 +215,7 @@ async function handleProfileSub(request, env, id) {
   applyPersonalRules(config, publicBase(request, env));
   applyProvider(config, `${publicBase(request, env)}/provider/${id}`, env);
 
-  return yamlResponse(stringifyYaml(config, { lineWidth: 0 }), {
+  return yamlResponse(env, stringifyYaml(config, { lineWidth: 0 }), {
     "x-config-source": profile.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
   });
 }
@@ -357,7 +357,7 @@ async function handleSub(request, env) {
     applyProvider(config, providerUrl, env);
   }
 
-  return yamlResponse(stringifyYaml(config, { lineWidth: 0 }), {
+  return yamlResponse(env, stringifyYaml(config, { lineWidth: 0 }), {
     "x-config-source": configUrl,
     "x-node-count": String(nodes?.proxies?.length || 0),
   });
@@ -761,11 +761,13 @@ function getCache() {
   }
 }
 
-function yamlResponse(body, extraHeaders = {}) {
+function yamlResponse(env, body, extraHeaders = {}) {
+  const name = env?.PROFILE_NAME || "Clash 网关订阅";
+  const encoded = encodeURIComponent(`${name}.yaml`);
   return new Response(body, {
     headers: {
       "content-type": "text/yaml; charset=utf-8",
-      "content-disposition": 'attachment; filename="clash.yaml"',
+      "content-disposition": `attachment; filename="clash-gateway.yaml"; filename*=UTF-8''${encoded}`,
       "profile-update-interval": "1",
       "cache-control": "no-store",
       ...CORS,
