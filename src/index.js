@@ -1,5 +1,7 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseSubscription } from "./parser.js";
+import { buildBase64Subscription } from "./uris.js";
+import { buildSurgeConfig } from "./surge.js";
 
 const VERSION = "1.1.0";
 const DEFAULT_CONFIG_URL =
@@ -86,7 +88,12 @@ export default {
         case "/health":
           return json({ status: "ok", version: VERSION });
         case "/sub":
+        case "/stash":
           return await handleSub(request, env);
+        case "/surge":
+          return await handleSub(request, env, "surge");
+        case "/shadowrocket":
+          return await handleSub(request, env, "base64");
         case "/provider":
           return await handleProvider(request, env, ctx);
         default:
@@ -132,6 +139,7 @@ async function handleGetSettings(request, env) {
   const nodes = await readNodes(env);
   return json({
     config: settings?.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
+    urls: resolveSubscriptionUrls(settings, env),
     url: settings?.url || "",
     name: await resolveProfileName(env, settings),
     updatedAt: settings?.updatedAt || null,
@@ -144,17 +152,25 @@ async function handleSaveSettings(request, env) {
   if (!env.PROFILES) throw new HttpError(500, "未配置 KV 命名空间 PROFILES");
 
   const body = await readJson(request);
-  const subscriptionUrl = normalizeSubscriptionUrl(body.url);
+  let rawUrls = Array.isArray(body.urls) ? body.urls : typeof body.urls === "string" ? body.urls.split(/\r?\n/) : [];
+  if (rawUrls.length === 0 && body.url) rawUrls = [body.url];
+  const urls = [];
+  for (const raw of rawUrls) {
+    const value = normalizeSubscriptionUrl(raw);
+    if (!urls.includes(value)) urls.push(value);
+  }
+  if (urls.length === 0) throw new HttpError(400, "至少填写一个订阅地址");
+
   const configUrl = normalizeConfigUrl(body.config, env);
   const name = typeof body.name === "string" ? body.name.trim().slice(0, 60) : "";
   const updatedAt = new Date().toISOString();
 
   await env.PROFILES.put(
     SETTINGS_KEY,
-    JSON.stringify({ url: subscriptionUrl, config: configUrl, name, updatedAt }),
+    JSON.stringify({ url: urls[0], urls, config: configUrl, name, updatedAt }),
   );
 
-  return json({ ok: true, config: configUrl, url: subscriptionUrl, name: name || undefined, updatedAt });
+  return json({ ok: true, config: configUrl, urls, name: name || undefined, updatedAt });
 }
 
 async function handleDeleteSettings(request, env) {
@@ -217,7 +233,7 @@ async function handleProfileSub(request, env, id) {
   applyPersonalRules(config, publicBase(request, env));
   applyProvider(config, `${publicBase(request, env)}/provider/${id}`, env);
 
-  return yamlResponse(await resolveProfileName(env), env, stringifyYaml(config, { lineWidth: 0 }), {
+  return configResponse(await resolveProfileName(env), env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
     "x-config-source": profile.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
   });
 }
@@ -329,10 +345,11 @@ function isPrivateHost(hostname) {
 
 /* ------------------------------ 固定订阅模式 ------------------------------ */
 
-async function handleSub(request, env) {
+async function handleSub(request, env, targetOverride) {
   requireToken(request, env);
 
   const token = providedToken(request);
+  const target = targetOverride || new URL(request.url).searchParams.get("target") || "clash";
   const settings = await loadSettings(env);
 
   // 每次订阅更新时，顺手把机场节点刷新进 KV
@@ -342,6 +359,17 @@ async function handleSub(request, env) {
   } catch (error) {
     console.error(JSON.stringify({ level: "warn", message: "订阅更新时刷新 KV 失败", error: error.message }));
     nodes = await readNodes(env);
+  }
+
+  const name = await resolveProfileName(env, settings);
+
+  if (target === "base64") {
+    if (!nodes?.proxies?.length) throw new HttpError(422, "没有可用节点");
+    const body = buildBase64Subscription(nodes.proxies);
+    return configResponse(name, env, body, "text/plain; charset=utf-8", {
+      "x-node-count": String(nodes.proxies.length),
+      "profile-update-interval": "12",
+    });
   }
 
   const { config, configUrl } = await fetchConfig(
@@ -360,7 +388,16 @@ async function handleSub(request, env) {
     applyProvider(config, providerUrl, env);
   }
 
-  return yamlResponse(await resolveProfileName(env, settings), env, stringifyYaml(config, { lineWidth: 0 }), {
+  if (target === "surge") {
+    if (!nodes?.proxies?.length) throw new HttpError(422, "Surge 配置需要节点，当前没有可用节点");
+    const body = buildSurgeConfig(config, nodes.proxies, publicBase(request, env));
+    return configResponse(name, env, body, "text/plain; charset=utf-8", {
+      "x-config-source": configUrl,
+      "x-node-count": String(nodes.proxies.length),
+    });
+  }
+
+  return configResponse(name, env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
     "x-config-source": configUrl,
     "x-node-count": String(nodes?.proxies?.length || 0),
   });
@@ -383,24 +420,60 @@ async function readNodes(env) {
   }
 }
 
+function resolveSubscriptionUrls(settings, env) {
+  const urls = [];
+  const push = (value) => {
+    const text = String(value || "").trim();
+    if (text && !urls.includes(text)) urls.push(text);
+  };
+  for (const url of Array.isArray(settings?.urls) ? settings.urls : []) push(url);
+  if (urls.length === 0 && settings?.url) push(settings.url);
+  if (urls.length === 0 && env.SUBSCRIPTION_URL) push(env.SUBSCRIPTION_URL);
+  return urls;
+}
+
 async function refreshNodes(env) {
   if (!env.PROFILES) throw new HttpError(500, "未配置 KV 命名空间 PROFILES");
 
   const settings = await loadSettings(env);
-  const subscriptionUrl = settings?.url || env.SUBSCRIPTION_URL;
-  if (!subscriptionUrl) {
+  const urls = resolveSubscriptionUrls(settings, env);
+  if (urls.length === 0) {
     throw new HttpError(500, "未配置订阅地址：请在 Worker 首页填写并保存");
   }
 
-  const text = await fetchSubscription(subscriptionUrl, env);
-  const nodes = parseSubscription(text);
-  if (nodes.length === 0) {
-    throw new HttpError(422, "没有解析到节点，请检查订阅地址或 UA");
+  let all = [];
+  const failed = [];
+  for (const subscriptionUrl of urls) {
+    try {
+      const text = await fetchSubscription(subscriptionUrl, env);
+      const parsed = parseSubscription(text);
+      if (parsed.length === 0) throw new Error("没有解析到节点");
+      all = all.concat(parsed);
+    } catch (error) {
+      failed.push(`${new URL(subscriptionUrl).host}: ${error.message}`);
+    }
+  }
+
+  if (all.length === 0) {
+    throw new HttpError(422, `所有订阅都解析失败：${failed.join("；")}`);
+  }
+  if (failed.length > 0) {
+    console.error(JSON.stringify({ level: "warn", message: "部分订阅失败", failed }));
+  }
+
+  // 跨订阅去重：同类型 + 同服务器 + 同端口 + 同凭据
+  const seen = new Set();
+  const unique = [];
+  for (const node of all) {
+    const key = `${node.type}|${node.server}|${node.port}|${node.uuid || node.password || node.username || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(node);
   }
 
   // Clash 要求节点名唯一，重名自动加序号
   const used = new Map();
-  for (const node of nodes) {
+  for (const node of unique) {
     const base = String(node.name || `${node.type}-${node.server}`).trim();
     const times = used.get(base) || 0;
     used.set(base, times + 1);
@@ -408,8 +481,8 @@ async function refreshNodes(env) {
   }
 
   const record = {
-    proxies: nodes,
-    count: nodes.length,
+    proxies: unique,
+    count: unique.length,
     updatedAt: new Date().toISOString(),
   };
   await env.PROFILES.put(NODES_KEY, JSON.stringify(record));
@@ -618,10 +691,15 @@ async function handleRule(request, env, ctx, file) {
 
   let upstream;
   let ttl;
+  let transform;
   if (/^personal-[a-z0-9-]+\.list$/.test(file)) {
     const listBase = (env.PERSONAL_RULES_URL || DEFAULT_PERSONAL_RULES_URL).replace(/[^/]*$/, "");
     upstream = listBase + file;
     ttl = 300;
+  } else if (/\.list$/.test(file)) {
+    upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
+    ttl = 86400;
+    transform = "surge-domain-set";
   } else if (/\.mrs$/.test(file)) {
     upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
     ttl = 86400;
@@ -648,8 +726,21 @@ async function handleRule(request, env, ctx, file) {
   }
   if (!response.ok) throw new HttpError(502, `规则下载失败：HTTP ${response.status}`);
 
-  const body = await response.arrayBuffer();
-  const contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
+  let body;
+  let contentType;
+  if (transform === "surge-domain-set") {
+    const text = await response.text();
+    body = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && !line.startsWith("-") && !line.startsWith("*"))
+      .map((line) => line.replace(/^\+\./, ""))
+      .join("\n");
+    contentType = "text/plain; charset=utf-8";
+  } else {
+    body = await response.arrayBuffer();
+    contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
+  }
   const output = new Response(body, {
     headers: {
       "content-type": contentType,
@@ -846,13 +937,16 @@ async function resolveProfileName(env, settings) {
   return (s?.name || env?.PROFILE_NAME || "Clash 网关订阅").trim() || "Clash 网关订阅";
 }
 
-function yamlResponse(name, env, body, extraHeaders = {}) {
-  const label = (name || env?.PROFILE_NAME || "Clash 网关订阅").trim() || "Clash 网关订阅";
-  const encoded = encodeURIComponent(label);
+function contentDisposition(name) {
+  const label = (name || "Clash 网关订阅").trim() || "Clash 网关订阅";
+  return `attachment; filename="clash-gateway"; filename*=UTF-8''${encodeURIComponent(label)}`;
+}
+
+function configResponse(name, env, body, contentType, extraHeaders = {}) {
   return new Response(body, {
     headers: {
-      "content-type": "text/yaml; charset=utf-8",
-      "content-disposition": `attachment; filename="clash-gateway"; filename*=UTF-8''${encoded}`,
+      "content-type": contentType,
+      "content-disposition": contentDisposition(name),
       "profile-update-interval": "1",
       "cache-control": "no-store",
       ...CORS,
@@ -904,6 +998,7 @@ function infoPage(env, request) {
   label{display:block;font-size:12px;color:#8b98ad;margin:12px 0 6px}
   .hint{font-size:12px;color:#5d6a80;margin:6px 0 0}
   input{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #2a3546;border-radius:9px;background:#0b101b;color:#e8edf7;font:inherit;font-size:13px}
+  textarea{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #2a3546;border-radius:9px;background:#0b101b;color:#e8edf7;font:inherit;font-size:13px;resize:vertical}
   input:focus{outline:none;border-color:#7c5cff}
   .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
   button{padding:8px 16px;border:1px solid transparent;border-radius:9px;background:linear-gradient(110deg,#7c5cff,#4f8cff 60%,#22d3ee);color:#fff;font:inherit;font-size:13px;font-weight:600;cursor:pointer}
@@ -929,8 +1024,8 @@ function infoPage(env, request) {
     <p class="hint">明文显示：带 <code>?token=你的令牌</code> 打开本页即可看到；直接打开则留空。</p>
     <label for="config">GitHub 配置链接（YAML）</label>
     <input id="config" type="url" value="${escapeHtml(configUrl)}" placeholder="https://.../clash-remote.yaml">
-    <label for="url">机场订阅链接</label>
-    <input id="url" type="url" placeholder="https://example.com/api/v1/client/subscribe?token=...">
+    <label for="url">机场订阅链接（每行一个，可多个，自动合并）</label>
+    <textarea id="url" rows="3" placeholder="https://example.com/subscribe-1&#10;https://example.com/subscribe-2"></textarea>
     <label for="pname">订阅名字（导入 Clash 时显示）</label>
     <input id="pname" type="text" placeholder="Clash 网关订阅">
     <div class="row">
@@ -944,6 +1039,9 @@ function infoPage(env, request) {
     <div class="result" id="result" hidden>
       <a id="sub-link" target="_blank" rel="noreferrer"></a>
       <div class="row"><button id="copy" class="ghost" type="button">复制订阅地址</button></div>
+      <p class="hint">Clash / Stash（Mihomo）：同上 /sub 链接</p>
+      <p class="hint">Surge：<a id="link-surge" target="_blank" rel="noreferrer"></a></p>
+      <p class="hint">Shadowrocket（小火箭）：<a id="link-sr" target="_blank" rel="noreferrer"></a></p>
     </div>
   </div>
 
@@ -980,6 +1078,16 @@ function infoPage(env, request) {
     var sub = location.origin + "/sub?token=" + encodeURIComponent(token);
     subLink.textContent = sub;
     subLink.href = sub;
+    var surge = document.getElementById("link-surge");
+    var sr = document.getElementById("link-sr");
+    if (surge) {
+      surge.textContent = location.origin + "/surge?token=" + encodeURIComponent(token);
+      surge.href = surge.textContent;
+    }
+    if (sr) {
+      sr.textContent = location.origin + "/shadowrocket?token=" + encodeURIComponent(token);
+      sr.href = sr.textContent;
+    }
     result.hidden = false;
   }
 
@@ -1023,7 +1131,8 @@ function infoPage(env, request) {
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
       configInput.value = data.config || "";
-      urlInput.value = data.url || "";
+      var urls = data.urls && data.urls.length ? data.urls : (data.url ? [data.url] : []);
+      urlInput.value = urls.join("\n");
       nameInput.value = data.name || "";
       localStorage.setItem("clash-gateway-token", token());
       showSub(token());
@@ -1042,7 +1151,11 @@ function infoPage(env, request) {
       var response = await fetch("/api/settings", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer " + token() },
-        body: JSON.stringify({ config: configInput.value.trim(), url: urlInput.value.trim(), name: nameInput.value.trim() }),
+        body: JSON.stringify({
+          config: configInput.value.trim(),
+          urls: urlInput.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean),
+          name: nameInput.value.trim(),
+        }),
       });
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
