@@ -1154,7 +1154,7 @@ function infoPage(env, request) {
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
       configInput.value = data.config || "";
       var urls = data.urls && data.urls.length ? data.urls : (data.url ? [data.url] : []);
-      urlInput.value = urls.join("\n");
+      urlInput.value = urls.join("\\n");
       nameInput.value = data.name || "";
       localStorage.setItem("clash-gateway-token", token());
       showSub(token());
@@ -1175,7 +1175,7 @@ function infoPage(env, request) {
         headers: { "content-type": "application/json", authorization: "Bearer " + token() },
         body: JSON.stringify({
           config: configInput.value.trim(),
-          urls: urlInput.value.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean),
+          urls: urlInput.value.split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean),
           name: nameInput.value.trim(),
         }),
       });
