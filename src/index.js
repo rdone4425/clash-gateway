@@ -1,7 +1,5 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseSubscription } from "./parser.js";
-import { buildBase64Subscription } from "./uris.js";
-import { buildSurgeConfig } from "./surge.js";
 
 const VERSION = "1.1.0";
 const DEFAULT_CONFIG_URL =
@@ -90,10 +88,6 @@ export default {
         case "/sub":
         case "/stash":
           return await handleSub(request, env);
-        case "/surge":
-          return await handleSub(request, env, "surge");
-        case "/shadowrocket":
-          return await handleSub(request, env, "base64");
         case "/provider":
           return await handleProvider(request, env, ctx);
         default:
@@ -345,11 +339,10 @@ function isPrivateHost(hostname) {
 
 /* ------------------------------ 固定订阅模式 ------------------------------ */
 
-async function handleSub(request, env, targetOverride) {
+async function handleSub(request, env) {
   requireToken(request, env);
 
   const token = providedToken(request);
-  const target = targetOverride || new URL(request.url).searchParams.get("target") || "clash";
   const settings = await loadSettings(env);
 
   // 每次订阅更新时，顺手把机场节点刷新进 KV
@@ -359,17 +352,6 @@ async function handleSub(request, env, targetOverride) {
   } catch (error) {
     console.error(JSON.stringify({ level: "warn", message: "订阅更新时刷新 KV 失败", error: error.message }));
     nodes = await readNodes(env);
-  }
-
-  const name = await resolveProfileName(env, settings);
-
-  if (target === "base64") {
-    if (!nodes?.proxies?.length) throw new HttpError(422, "没有可用节点");
-    const body = buildBase64Subscription(nodes.proxies);
-    return configResponse(name, env, body, "text/plain; charset=utf-8", {
-      "x-node-count": String(nodes.proxies.length),
-      "profile-update-interval": "12",
-    });
   }
 
   const { config, configUrl } = await fetchConfig(
@@ -388,16 +370,7 @@ async function handleSub(request, env, targetOverride) {
     applyProvider(config, providerUrl, env);
   }
 
-  if (target === "surge") {
-    if (!nodes?.proxies?.length) throw new HttpError(422, "Surge 配置需要节点，当前没有可用节点");
-    const body = buildSurgeConfig(config, nodes.proxies, publicBase(request, env));
-    return configResponse(name, env, body, "text/plain; charset=utf-8", {
-      "x-config-source": configUrl,
-      "x-node-count": String(nodes.proxies.length),
-    });
-  }
-
-  return configResponse(name, env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
+  return configResponse(await resolveProfileName(env, settings), env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
     "x-config-source": configUrl,
     "x-node-count": String(nodes?.proxies?.length || 0),
   });
@@ -691,15 +664,10 @@ async function handleRule(request, env, ctx, file) {
 
   let upstream;
   let ttl;
-  let transform;
   if (/^personal-[a-z0-9-]+\.list$/.test(file)) {
     const listBase = (env.PERSONAL_RULES_URL || DEFAULT_PERSONAL_RULES_URL).replace(/[^/]*$/, "");
     upstream = listBase + file;
     ttl = 300;
-  } else if (/\.list$/.test(file)) {
-    upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
-    ttl = 86400;
-    transform = "surge-domain-set";
   } else if (/\.mrs$/.test(file)) {
     upstream = `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/${file}`;
     ttl = 86400;
@@ -726,21 +694,8 @@ async function handleRule(request, env, ctx, file) {
   }
   if (!response.ok) throw new HttpError(502, `规则下载失败：HTTP ${response.status}`);
 
-  let body;
-  let contentType;
-  if (transform === "surge-domain-set") {
-    const text = await response.text();
-    body = text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#") && !line.startsWith("-") && !line.startsWith("*"))
-      .map((line) => line.replace(/^\+\./, ""))
-      .join("\n");
-    contentType = "text/plain; charset=utf-8";
-  } else {
-    body = await response.arrayBuffer();
-    contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
-  }
+  const body = await response.arrayBuffer();
+  const contentType = file.endsWith(".mrs") ? "application/octet-stream" : "text/plain; charset=utf-8";
   const output = new Response(body, {
     headers: {
       "content-type": contentType,
@@ -1040,8 +995,6 @@ function infoPage(env, request) {
       <a id="sub-link" target="_blank" rel="noreferrer"></a>
       <div class="row"><button id="copy" class="ghost" type="button">复制订阅地址</button></div>
       <p class="hint">Clash / Stash（Mihomo）：同上 /sub 链接</p>
-      <p class="hint">Surge：<a id="link-surge" target="_blank" rel="noreferrer"></a></p>
-      <p class="hint">Shadowrocket（小火箭）：<a id="link-sr" target="_blank" rel="noreferrer"></a></p>
     </div>
   </div>
 
@@ -1078,16 +1031,6 @@ function infoPage(env, request) {
     var sub = location.origin + "/sub?token=" + encodeURIComponent(token);
     subLink.textContent = sub;
     subLink.href = sub;
-    var surge = document.getElementById("link-surge");
-    var sr = document.getElementById("link-sr");
-    if (surge) {
-      surge.textContent = location.origin + "/surge?token=" + encodeURIComponent(token);
-      surge.href = surge.textContent;
-    }
-    if (sr) {
-      sr.textContent = location.origin + "/shadowrocket?token=" + encodeURIComponent(token);
-      sr.href = sr.textContent;
-    }
     result.hidden = false;
   }
 
