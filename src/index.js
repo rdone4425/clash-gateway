@@ -354,6 +354,7 @@ async function handleSub(request, env) {
 
   if (nodes?.proxies?.length) {
     applyInlineNodes(config, nodes.proxies);
+    applyRegionGroups(config, nodes.proxies);
   } else {
     const providerUrl = `${publicBase(request, env)}/provider?token=${encodeURIComponent(token)}`;
     applyProvider(config, providerUrl, env);
@@ -531,6 +532,74 @@ function applyPersonalRules(config, base) {
   const rules = Array.isArray(config.rules) ? config.rules : [];
   if (!rules.some((rule) => typeof rule === "string" && rule.startsWith("RULE-SET,personal-direct,"))) {
     config.rules = [`RULE-SET,personal-direct,${target}`, ...rules];
+  }
+}
+
+/**
+ * 地区识别表：按节点名匹配（国旗 emoji / ISO 代码 / 中文名 / 常见英文词）。
+ */
+const REGION_TABLE = [
+  { name: "🇭🇰 香港", match: ["HK", "HKG", "HONGKONG", "HONG KONG", "香港", "🇭🇰"] },
+  { name: "🇹🇼 台湾", match: ["TW", "TWN", "台湾", "臺灣", "台北", "🇹🇼"] },
+  { name: "🇯🇵 日本", match: ["JP", "JPN", "JAPAN", "日本", "东京", "大阪", "🇯🇵"] },
+  { name: "🇰🇷 韩国", match: ["KR", "KOR", "KOREA", "韩国", "首尔", "🇰🇷"] },
+  { name: "🇸🇬 新加坡", match: ["SG", "SGP", "SINGAPORE", "新加坡", "狮城", "🇸🇬"] },
+  { name: "🇺🇸 美国", match: ["US", "USA", "AMERICA", "美国", "洛杉矶", "圣何塞", "🇺🇸"] },
+  { name: "🇬🇧 英国", match: ["UK", "GB", "GBR", "英国", "伦敦", "🇬🇧"] },
+  { name: "🇩🇪 德国", match: ["DE", "GER", "德国", "法兰克福", "🇩🇪"] },
+  { name: "🇫🇷 法国", match: ["FR", "FRA", "法国", "巴黎", "🇫🇷"] },
+  { name: "🇳🇱 荷兰", match: ["NL", "NLD", "荷兰", "阿姆斯特丹", "🇳🇱"] },
+  { name: "🇷🇺 俄罗斯", match: ["RU", "RUS", "俄罗斯", "莫斯科", "🇷🇺"] },
+  { name: "🇲🇾 马来西亚", match: ["MY", "MYS", "马来西亚", "吉隆坡", "🇲🇾"] },
+  { name: "🇹🇭 泰国", match: ["TH", "THA", "泰国", "曼谷", "🇹🇭"] },
+  { name: "🇻🇳 越南", match: ["VN", "VNM", "越南", "🇻🇳"] },
+  { name: "🇵🇭 菲律宾", match: ["PH", "PHL", "菲律宾", "🇵🇭"] },
+  { name: "🇮🇳 印度", match: ["IN", "IND", "印度", "孟买", "🇮🇳"] },
+  { name: "🇮🇩 印尼", match: ["ID", "IDN", "印尼", "雅加达", "🇮🇩"] },
+  { name: "🇨🇦 加拿大", match: ["CA", "CAN", "加拿大", "🇨🇦"] },
+  { name: "🇦🇺 澳大利亚", match: ["AU", "AUS", "澳大利亚", "澳洲", "悉尼", "🇦🇺"] },
+  { name: "🇧🇷 巴西", match: ["BR", "BRA", "巴西", "🇧🇷"] },
+  { name: "🇹🇷 土耳其", match: ["TR", "TUR", "土耳其", "🇹🇷"] },
+  { name: "🇦🇷 阿根廷", match: ["AR", "ARG", "阿根廷", "🇦🇷"] },
+];
+
+function matchRegion(name, region) {
+  const upper = String(name).toUpperCase();
+  return region.match.some((kw) => {
+    if (!/^[A-Z][A-Z ]*$/i.test(kw)) return upper.includes(kw);
+    return new RegExp(`(^|[^A-Z])${kw}([^A-Z]|$)`).test(upper);
+  });
+}
+
+function buildRegionGroups(nodes) {
+  const groups = [];
+  for (const region of REGION_TABLE) {
+    const members = nodes.filter((node) => matchRegion(node.name, region)).map((node) => node.name);
+    if (members.length === 0) continue;
+    groups.push({ name: region.name, type: "select", proxies: [...members, "DIRECT"] });
+  }
+  return groups;
+}
+
+/**
+ * 按节点地区生成国家组，插到策略组之后，并挂进 🚀 节点选择。
+ */
+function applyRegionGroups(config, nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) return;
+  const regionGroups = buildRegionGroups(nodes);
+  if (regionGroups.length === 0) return;
+
+  const groups = Array.isArray(config["proxy-groups"]) ? config["proxy-groups"] : [];
+  const anchor = groups.findIndex((g) => g && g.name === "🔮 负载均衡");
+  const insertAt = anchor >= 0 ? anchor + 1 : groups.length;
+  groups.splice(insertAt, 0, ...regionGroups);
+
+  const main = groups.find((g) => g && g.name === "🚀 节点选择");
+  if (main && Array.isArray(main.proxies)) {
+    const names = regionGroups.map((g) => g.name);
+    const directIndex = main.proxies.indexOf("DIRECT");
+    if (directIndex >= 0) main.proxies.splice(directIndex, 0, ...names);
+    else main.proxies.unshift(...names);
   }
 }
 
