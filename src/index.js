@@ -4,14 +4,14 @@ import qrcode from "qrcode-generator";
 
 const VERSION = "1.1.0";
 const DEFAULT_CONFIG_URL =
-  "https://rdone4425.github.io/clash-configs/configs/clash-remote.yaml";
+  "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/clash-remote.yaml";
 const DEFAULT_TTL = 300;
 const MAX_TTL = 3600;
 const ID_PATTERN = /^[a-f0-9]{32}$/;
 const SETTINGS_KEY = "settings:global";
 const NODES_KEY = "nodes:global";
 const DEFAULT_PERSONAL_RULES_URL =
-  "https://rdone4425.github.io/clash-configs/configs/rules/personal-direct.list";
+  "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/personal-direct.list";
 
 const CORS = {
   "access-control-allow-origin": "*",

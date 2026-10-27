@@ -12,8 +12,8 @@
   },
   "vars": {
     "PROFILE_NAME": "Clash 网关订阅",
-    "CONFIG_URL": "https://rdone4425.github.io/clash-configs/configs/clash-remote.yaml",
-    "PERSONAL_RULES_URL": "https://rdone4425.github.io/clash-configs/configs/rules/personal-direct.list",
+    "CONFIG_URL": "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/clash-remote.yaml",
+    "PERSONAL_RULES_URL": "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/personal-direct.list",
     "PUBLIC_BASE": "https://clash-gateway.rdone.eu.cc",
     "CACHE_TTL": "300",
     "NODE_TTL": "1800",
