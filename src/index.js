@@ -914,7 +914,7 @@ async function fetchSubscription(url, env) {
   try {
     response = await fetch(url, {
       headers: {
-        "user-agent": env.SUBSCRIPTION_UA || "v2rayN/6.42",
+        "user-agent": String(env.SUBSCRIPTION_UA || "ClashMeta/1.19").trim(),
         accept: "*/*",
       },
       redirect: "follow",
@@ -944,7 +944,8 @@ async function readJson(request) {
 }
 
 function requireToken(request, env) {
-  const expected = env.ACCESS_TOKEN;
+  // 容忍 secret 首尾误带的空白/换行（wrangler secret put 经管道写入时常见）
+  const expected = String(env.ACCESS_TOKEN || "").trim();
   if (!expected) throw new HttpError(500, "未配置 ACCESS_TOKEN");
 
   const provided = providedToken(request);
@@ -1047,9 +1048,10 @@ function html(body) {
 
 function infoPage(env, request) {
   const configUrl = env.CONFIG_URL || DEFAULT_CONFIG_URL;
+  const expected = String(env.ACCESS_TOKEN || "").trim();
   const revealed =
-    providedToken(request) && providedToken(request) === env.ACCESS_TOKEN
-      ? env.ACCESS_TOKEN
+    providedToken(request) && providedToken(request) === expected
+      ? expected
       : "";
   return `<!doctype html>
 <html lang="zh-CN">
