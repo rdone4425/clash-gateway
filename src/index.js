@@ -717,7 +717,16 @@ function buildRegionGroups(nodes) {
   for (const region of REGION_TABLE) {
     const members = nodes.filter((node) => matchRegion(node.name, region)).map((node) => node.name);
     if (members.length === 0) continue;
-    groups.push({ name: region.name, type: "select", proxies: [...members, "DIRECT"] });
+    // 地区组用 url-test 自动选该地区延迟最低的节点：
+    // 成员只能是节点，不能混入 DIRECT（内置策略无法测速）
+    groups.push({
+      name: region.name,
+      type: "url-test",
+      url: "http://www.gstatic.com/generate_204",
+      interval: 300,
+      tolerance: 150,
+      proxies: members,
+    });
   }
   return groups;
 }
