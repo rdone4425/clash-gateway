@@ -1,0 +1,42 @@
+name: Deploy Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check Cloudflare secrets
+        id: check
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install
+        if: steps.check.outputs.configured == 'true'
+        run: npm install
+
+      - name: Deploy
+        if: steps.check.outputs.configured == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          secrets: |
+            ACCESS_TOKEN
+            SUBSCRIPTION_URL
+        env:
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          SUBSCRIPTION_URL: ${{ secrets.SUBSCRIPTION_URL }}

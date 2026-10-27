@@ -2,4 +2,10 @@ node_modules/
 .wrangler/
 .dev.vars
 *.log
-wrangler.jsonc
+output/
+.DS_Store
+
+# 本地私密文件：订阅地址 / 真实配置，严禁提交
+sub.url
+*.local.yaml
+wrangler.local.jsonc

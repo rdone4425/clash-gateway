@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "从 GitHub Pages 拉配置模板，并注入代理节点的 Cloudflare Worker",
+  "description": "Cloudflare Worker 订阅网关：把机场订阅转成 Clash/mihomo/Stash 配置，订阅只存服务端",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node test.mjs"
   },
   "dependencies": {
     "qrcode-generator": "^2.0.4",

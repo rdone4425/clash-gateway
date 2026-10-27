@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clash-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-12",
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "vars": {
+    "PROFILE_NAME": "Clash 网关订阅",
+    "CONFIG_URL": "https://rdone4425.github.io/clash-configs/configs/clash-remote.yaml",
+    "PERSONAL_RULES_URL": "https://rdone4425.github.io/clash-configs/configs/rules/personal-direct.list",
+    "PUBLIC_BASE": "https://clash-gateway.rdone.eu.cc",
+    "CACHE_TTL": "300",
+    "NODE_TTL": "1800",
+    "PROVIDER_INTERVAL": "1800"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "PROFILES",
+      "id": "edc58efdf1bc4fdd9d96ea3d292d7310"
+    }
+  ]
+}

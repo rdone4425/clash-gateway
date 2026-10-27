@@ -1,12 +1,12 @@
-> 注意：这个目录在公开仓库里，`wrangler.jsonc` 的 `ACCESS_TOKEN` 是占位符，部署前换成你自己的值（或改用 Cloudflare 控制台设置），不要把真实 token 提交上来。
+> 公开仓库，`wrangler.jsonc` 里不含真实 token。部署前用 `npx wrangler secret put ACCESS_TOKEN` 和 `npx wrangler secret put SUBSCRIPTION_URL` 写入 secret，不要把真实值提交上来。
 
 # Clash Gateway
 
 一个 Cloudflare Worker：从 GitHub Pages 拉取 Clash 配置模板，把 `proxy-providers` 指向自己，再解析机场订阅提供节点。
 
-- 配置模板仍然在 `rdone4425/clash-configs` 维护，改完 push 就生效
+- 配置模板在 [`rdone4425/clash-configs`](https://github.com/rdone4425/clash-configs) 维护，改完 push 就生效
 - 节点只在 Worker 内存和边缘缓存里，不写入 GitHub
-- 订阅地址保存在 Worker secret，不出现在前端或仓库
+- 订阅地址保存在 Worker secret / KV，不出现在前端或仓库
 
 ## 架构
 
@@ -22,7 +22,7 @@ Clash → /provider?token=...  → 拉机场订阅 → 解析节点 → 返回 p
 ```bash
 npm install
 npx wrangler login
-npx wrangler deploy
+npm run deploy
 ```
 
 ## 配置
