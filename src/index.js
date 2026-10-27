@@ -10,6 +10,7 @@ const MAX_TTL = 3600;
 const ID_PATTERN = /^[a-f0-9]{32}$/;
 const SETTINGS_KEY = "settings:global";
 const NODES_KEY = "nodes:global";
+const CONFIG_CACHE_KEY = "config:last";
 const DEFAULT_PERSONAL_RULES_URL =
   "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/personal-direct.list";
 
@@ -83,7 +84,7 @@ async function kvGetDecrypted(env, key) {
     try {
       await kvPutEncrypted(env, key, text);
     } catch (error) {
-      console.error(JSON.stringify({ level: "warn", message: "明文迁移加密失败", error: error.message }));
+      console.error(JSON.stringify({ level: "warn", message: "明文迁移加密失败", error: maskError(error) }));
     }
   }
   return text;
@@ -102,6 +103,12 @@ function maskSecretUrl(value) {
   } catch {
     return "****";
   }
+}
+
+/** 异常信息里可能带完整 URL（fetch 的报错就带），打码后再进日志。 */
+function maskError(error) {
+  const message = String((error && error.message) || error || "");
+  return message.replace(/https?:\/\/[^\s"']+/g, (matched) => maskSecretUrl(matched));
 }
 
 class HttpError extends Error {
@@ -457,22 +464,28 @@ async function handleQr(request, env) {
 }
 
 async function handleSub(request, env, targetOverride) {
+  const startedAt = Date.now();
   requireToken(request, env);
 
   const token = providedToken(request);
   const target = targetOverride || "clash";
   const settings = await loadSettings(env);
 
-  // 每次订阅更新时，顺手把机场节点刷新进 KV
-  let nodes = null;
-  try {
-    nodes = await refreshNodes(env);
-  } catch (error) {
-    console.error(JSON.stringify({ level: "warn", message: "订阅更新时刷新 KV 失败", error: error.message }));
-    nodes = await readNodes(env);
+  // 节点按 NODE_TTL 缓存：TTL 内直接用 KV，不重复拉机场订阅。
+  // 以前这里无条件 refreshNodes，导致每次订阅刷新都要等 3～8 秒拉机场。
+  const nodeTtl = resolveNodeTtl(env);
+  let nodes = await readNodes(env);
+  const nodesFresh = nodes && Date.now() - Date.parse(nodes.updatedAt) < nodeTtl * 1000;
+  if (!nodesFresh) {
+    try {
+      nodes = await refreshNodes(env);
+    } catch (error) {
+      console.error(JSON.stringify({ level: "warn", message: "节点刷新失败，沿用缓存", error: maskError(error) }));
+      // nodes 保持缓存值；若缓存也为空则走下面的 provider 分支
+    }
   }
 
-  const { config, configUrl } = await fetchConfig(
+  const { config, configUrl, cache: configCache } = await fetchConfig(
     settings?.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
     env,
   );
@@ -506,6 +519,9 @@ async function handleSub(request, env, targetOverride) {
   return configResponse(await resolveProfileName(env, settings), env, stringifyYaml(config, { lineWidth: 0 }), "text/yaml; charset=utf-8", {
     "x-config-source": configUrl,
     "x-node-count": String(nodes?.proxies?.length || 0),
+    "x-config-cache": configCache || "miss",
+    "x-nodes-cache": nodesFresh ? "hit" : "miss",
+    "x-ms": String(Date.now() - startedAt),
   });
 }
 
@@ -556,7 +572,7 @@ async function refreshNodes(env) {
       if (parsed.length === 0) throw new Error("没有解析到节点");
       all = all.concat(parsed);
     } catch (error) {
-      failed.push(`${new URL(subscriptionUrl).host}: ${error.message}`);
+      failed.push(`${new URL(subscriptionUrl).host}: ${maskError(error)}`);
     }
   }
 
@@ -567,11 +583,20 @@ async function refreshNodes(env) {
     console.error(JSON.stringify({ level: "warn", message: "部分订阅失败", failed }));
   }
 
-  // 跨订阅去重：同类型 + 同服务器 + 同端口 + 同凭据
+  // 跨订阅去重：类型 + 服务器 + 端口 + 凭据 + 传输层特征
+  // （早期的 key 只到凭据，会把同一服务器不同 ws path / sni 的节点误删）
   const seen = new Set();
   const unique = [];
   for (const node of all) {
-    const key = `${node.type}|${node.server}|${node.port}|${node.uuid || node.password || node.username || ""}`;
+    const ws = node["ws-opts"] || {};
+    const grpc = node["grpc-opts"] || {};
+    const transport = [
+      node.network || "",
+      node.servername || node.sni || "",
+      ws.path || grpc["grpc-service-name"] || "",
+      (ws.headers && (ws.headers.Host || ws.headers.host)) || "",
+    ].join("~");
+    const key = `${node.type}|${node.server}|${node.port}|${node.uuid || node.password || node.username || ""}|${transport}`;
     if (seen.has(key)) continue;
     seen.add(key);
     unique.push(node);
@@ -618,7 +643,7 @@ async function serveGlobalNodes(env, ctx) {
     } catch (error) {
       if (!record) throw error;
       stale = true;
-      console.error(JSON.stringify({ level: "warn", message: "节点刷新失败，使用 KV 旧数据", error: error.message }));
+      console.error(JSON.stringify({ level: "warn", message: "节点刷新失败，使用 KV 旧数据", error: maskError(error) }));
     }
   }
 
@@ -638,11 +663,25 @@ async function serveGlobalNodes(env, ctx) {
 /* -------------------------------- 公共逻辑 -------------------------------- */
 
 async function fetchConfig(configUrl, env) {
+  const ttl = resolveTtl(env);
+  const cache = getCache();
+  const cacheKey = cache ? new Request(`https://cache.internal/config/${await sha256(configUrl)}`) : null;
+
+  // 先看边缘缓存
+  if (cache && cacheKey) {
+    const hit = await cache.match(cacheKey);
+    if (hit) {
+      const parsed = parseConfigText(await hit.text());
+      if (parsed) return { config: parsed, configUrl, cache: "hit" };
+    }
+  }
+
   const target = new URL(configUrl);
-  // 每分钟一个新 key，避免拿到旧缓存；GitHub Pages 改完 1 分钟内生效
+  // 每分钟一个新 key，避免拿到旧缓存；GitHub 改完 1 分钟内生效
   target.searchParams.set("_", String(Math.floor(Date.now() / 60000)));
 
-  let response;
+  let response = null;
+  let error = null;
   try {
     response = await fetch(target.toString(), {
       headers: {
@@ -653,25 +692,68 @@ async function fetchConfig(configUrl, env) {
       cache: "no-store",
       signal: AbortSignal.timeout(15000),
     });
-  } catch (error) {
-    throw new HttpError(502, `拉取配置模板失败：${error.message}`);
+    if (!response.ok) {
+      error = new Error(`HTTP ${response.status}`);
+      response = null;
+    }
+  } catch (fetchError) {
+    error = fetchError;
   }
 
-  if (!response.ok) {
-    throw new HttpError(502, `拉取配置模板失败：HTTP ${response.status}`);
+  if (response) {
+    const text = await response.text();
+    const parsed = parseConfigText(text);
+    if (parsed) {
+      if (cache && cacheKey && ttl > 0) {
+        try {
+          await cache.put(cacheKey, new Response(text, {
+            headers: { "content-type": "text/yaml", "cache-control": `max-age=${ttl}` },
+          }));
+        } catch { /* 缓存写失败不影响主流程 */ }
+      }
+      if (env.PROFILES) {
+        try {
+          await kvPutEncrypted(env, CONFIG_CACHE_KEY, text);
+        } catch { /* 同上 */ }
+      }
+      return { config: parsed, configUrl, cache: "miss" };
+    }
+    error = new Error("配置模板不是合法的 YAML");
   }
 
-  const text = await response.text();
+  // 降级：用上一次成功拉到的模板，别让客户端直接 502
+  const stale = await readLastConfig(env);
+  if (stale) {
+    console.error(JSON.stringify({
+      level: "warn",
+      message: "配置模板拉取失败，使用上次缓存",
+      error: maskError(error),
+    }));
+    return { config: stale, configUrl, cache: "stale" };
+  }
+  throw new HttpError(502, `拉取配置模板失败：${maskError(error)}`);
+}
+
+function parseConfigText(text) {
   let config;
   try {
     config = parseYaml(text);
   } catch {
-    throw new HttpError(502, "配置模板不是合法的 YAML");
+    return null;
   }
-  if (!config || typeof config !== "object") {
-    throw new HttpError(502, "配置模板内容为空");
+  if (!config || typeof config !== "object") return null;
+  return config;
+}
+
+/** 上次成功拿到的模板（加密存在 KV），用于拉取失败时降级。 */
+async function readLastConfig(env) {
+  if (!env.PROFILES) return null;
+  try {
+    const raw = await kvGetDecrypted(env, CONFIG_CACHE_KEY);
+    return raw ? parseConfigText(raw) : null;
+  } catch {
+    return null;
   }
-  return { config, configUrl };
 }
 
 /**
@@ -723,7 +805,7 @@ async function applyPersonalRules(config, env, base, options = {}) {
         const ruleLines = parsePersonalList(text).map((line) => `${line},${target}`);
         rules.unshift(...ruleLines);
       } catch (error) {
-        console.error(JSON.stringify({ level: "warn", message: `个人规则 ${set.file} 加载失败`, error: error.message }));
+        console.error(JSON.stringify({ level: "warn", message: `个人规则 ${set.file} 加载失败`, error: maskError(error) }));
       }
     }
     config.rules = rules;
@@ -882,7 +964,7 @@ async function handleRule(request, env, ctx, file) {
       signal: AbortSignal.timeout(20000),
     });
   } catch (error) {
-    throw new HttpError(502, `规则下载失败：${error.message}`);
+    throw new HttpError(502, `规则下载失败：${maskError(error)}`);
   }
   if (!response.ok) throw new HttpError(502, `规则下载失败：HTTP ${response.status}`);
 
@@ -1011,7 +1093,7 @@ async function fetchSubscription(url, env) {
       signal: AbortSignal.timeout(20000),
     });
   } catch (error) {
-    throw new HttpError(502, `订阅请求失败：${error.message}`);
+    throw new HttpError(502, `订阅请求失败：${maskError(error)}`);
   }
 
   if (!response.ok) {
