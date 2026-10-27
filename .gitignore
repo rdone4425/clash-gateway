@@ -9,3 +9,6 @@ output/
 sub.url
 *.local.yaml
 wrangler.local.jsonc
+
+# ±æµÿ∑√Œ ¡Ó≈∆
+.token
