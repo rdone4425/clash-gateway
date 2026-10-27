@@ -3,7 +3,8 @@
   "name": "clash-gateway",
   "main": "src/index.js",
   "compatibility_date": "2026-10-12",
-  "upload_source_maps": true,
+  "upload_source_maps": false,
+  "preview_urls": false,
   "observability": {
     "enabled": true,
     "traces": {

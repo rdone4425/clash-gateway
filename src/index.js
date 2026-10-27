@@ -14,11 +14,64 @@ const CONFIG_CACHE_KEY = "config:last";
 const DEFAULT_PERSONAL_RULES_URL =
   "https://raw.githubusercontent.com/rdone44/loon-rules/main/clash/personal-direct.list";
 
-const CORS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
-  "access-control-allow-headers": "authorization, content-type",
-};
+// CORS 不再常量放开：下面 corsHeaders() 按同源策略逐请求生成，
+// 保留空对象只为让原有的 ...CORS 展开处不报错。
+const CORS = {};
+
+/**
+ * 只对同源请求回 CORS 头。
+ * Clash / mihomo / FlClash 走原生 HTTP，不需要 CORS；管理页也是同源，
+ * 所以拒绝跨域后只影响“拿着 token 的第三者网页”，正是要挡的。
+ */
+function corsHeaders(request, env) {
+  const origin = request.headers.get("origin");
+  if (!origin) return {};
+  const allowed = new Set();
+  try {
+    allowed.add(new URL(request.url).origin);
+  } catch { /* ignore */ }
+  if (env?.PUBLIC_BASE) {
+    try {
+      allowed.add(new URL(env.PUBLIC_BASE).origin);
+    } catch { /* ignore */ }
+  }
+  if (!allowed.has(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+    "access-control-allow-headers": "authorization, content-type",
+    vary: "origin",
+  };
+}
+
+/* ------------------------------ 限流（尽力而为） ------------------------------ */
+// Cloudflare 免费层的两个硬约束决定了限流只能做到这个程度：
+//   1. 纯内存计数被 isolate 打散（请求分到多个 isolate，各自计数）
+//   2. KV 写入有 ~60s 传播延迟，1 分钟窗口内读不到刚写的值，而且每请求
+//      一读一写会烧掉免费额度的 1000 写/天
+// 所以这里用内存做第一道拦截（零成本，能挡同一 isolate 内的连续刷），
+// 真正的硬限额需要 Durable Object 或 Cloudflare Rate Limiting（付费）。
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX = 120;
+const rateBuckets = new Map();
+
+function rateLimitRetryAfter(request, budget = RATE_MAX) {
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  const now = Date.now();
+  const bucket = rateBuckets.get(ip);
+  if (!bucket || now - bucket.start >= RATE_WINDOW_MS) {
+    rateBuckets.set(ip, { start: now, count: 1 });
+    if (rateBuckets.size > 2000) {
+      for (const [key, value] of rateBuckets) {
+        if (now - value.start >= RATE_WINDOW_MS) rateBuckets.delete(key);
+      }
+    }
+    return null;
+  }
+  bucket.count += 1;
+  if (bucket.count <= budget) return null;
+  return Math.max(1, Math.ceil((RATE_WINDOW_MS - (now - bucket.start)) / 1000));
+}
 
 /* ------------------------------ KV 静态加密 ------------------------------ */
 // KV 里不存明文：订阅地址、节点凭据（uuid/password/short-id）全部用 AES-GCM 加密后落盘。
@@ -112,9 +165,10 @@ function maskError(error) {
 }
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, options = {}) {
     super(message);
     this.status = status;
+    if (options.retryAfter) this.retryAfter = options.retryAfter;
   }
 }
 
@@ -123,10 +177,49 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS });
+      return new Response(null, { status: 204, headers: corsHeaders(request, env) });
     }
 
     try {
+      return await withCors(request, env, await route(request, env, ctx, url));
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : 500;
+      const message = error instanceof HttpError ? error.message : maskError(error) || "服务器错误";
+      if (status >= 500) {
+        console.error(JSON.stringify({ level: "error", path: url.pathname, status, message }));
+      }
+      let response;
+      if (url.pathname.startsWith("/api/")) {
+        response = json({ error: message }, status);
+      } else {
+        response = new Response(`请求失败：${message}\n`, {
+          status,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store",
+          },
+        });
+      }
+      if (error instanceof HttpError && error.retryAfter) {
+        response.headers.set("retry-after", String(error.retryAfter));
+      }
+      return withCors(request, env, response);
+    }
+  },
+};
+
+/** 给响应补上同源 CORS 头（不改 body，只复制 headers）。 */
+function withCors(request, env, response) {
+  const headers = corsHeaders(request, env);
+  if (Object.keys(headers).length === 0) return response;
+  const wrapped = new Response(response.body, response);
+  for (const [key, value] of Object.entries(headers)) wrapped.headers.set(key, value);
+  return wrapped;
+}
+
+async function route(request, env, ctx, url) {
+  {
+    {
       const profile = matchProfileRoute(url.pathname);
       if (profile) {
         if (request.method !== "GET") throw new HttpError(405, "只支持 GET");
@@ -180,35 +273,27 @@ export default {
           return json({ status: "ok", version: VERSION });
         case "/qr":
           return await handleQr(request, env);
-        case "/sub":
+        case "/sub": {
+          const wait = rateLimitRetryAfter(request);
+          if (wait) throw new HttpError(429, "请求过于频繁，请稍后再试", { retryAfter: wait });
           return await handleSub(request, env);
-        case "/stash":
+        }
+        case "/stash": {
+          const wait = rateLimitRetryAfter(request);
+          if (wait) throw new HttpError(429, "请求过于频繁，请稍后再试", { retryAfter: wait });
           return await handleSub(request, env, "stash");
-        case "/provider":
+        }
+        case "/provider": {
+          const wait = rateLimitRetryAfter(request);
+          if (wait) throw new HttpError(429, "请求过于频繁，请稍后再试", { retryAfter: wait });
           return await handleProvider(request, env, ctx);
+        }
         default:
           throw new HttpError(404, "Not Found");
       }
-    } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
-      const message = error.message || "服务器错误";
-      if (status >= 500) {
-        console.error(JSON.stringify({ level: "error", path: url.pathname, status, message }));
-      }
-      if (url.pathname.startsWith("/api/")) {
-        return json({ error: message }, status);
-      }
-      return new Response(`请求失败：${message}\n`, {
-        status,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
-          ...CORS,
-        },
-      });
     }
-  },
-};
+  }
+}
 
 /* -------------------------------- 全局设置 -------------------------------- */
 
