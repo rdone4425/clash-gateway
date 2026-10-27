@@ -19,6 +19,91 @@ const CORS = {
   "access-control-allow-headers": "authorization, content-type",
 };
 
+/* ------------------------------ KV 静态加密 ------------------------------ */
+// KV 里不存明文：订阅地址、节点凭据（uuid/password/short-id）全部用 AES-GCM 加密后落盘。
+// 密钥由 SETTINGS_SECRET 派生，未配置时回退到 ACCESS_TOKEN
+// （注意：换 ACCESS_TOKEN 会导致旧密文无法解密，需要重新保存一次设置）
+
+const ENC_PREFIX = "enc:v1:";
+
+async function kvCryptoKey(env) {
+  const secret = String(env.SETTINGS_SECRET || env.ACCESS_TOKEN || "").trim();
+  if (!secret) throw new HttpError(500, "未配置加密密钥（SETTINGS_SECRET 或 ACCESS_TOKEN）");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+function b64ToBuf(text) {
+  const bin = atob(text);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function encryptText(plain, env) {
+  const key = await kvCryptoKey(env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plain));
+  return `${ENC_PREFIX}${bufToB64(iv)}:${bufToB64(ct)}`;
+}
+
+async function decryptText(stored, env) {
+  if (typeof stored !== "string" || !stored.startsWith(ENC_PREFIX)) {
+    return { text: stored, encrypted: false };
+  }
+  const rest = stored.slice(ENC_PREFIX.length);
+  const sep = rest.indexOf(":");
+  if (sep <= 0) throw new HttpError(500, "密文格式损坏");
+  const key = await kvCryptoKey(env);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b64ToBuf(rest.slice(0, sep)) },
+    key,
+    b64ToBuf(rest.slice(sep + 1)),
+  );
+  return { text: new TextDecoder().decode(plain), encrypted: true };
+}
+
+async function kvPutEncrypted(env, key, text) {
+  await env.PROFILES.put(key, await encryptText(text, env));
+}
+
+/** 读 KV；如果是历史明文数据，读一次顺手加密回写。 */
+async function kvGetDecrypted(env, key) {
+  const raw = await env.PROFILES.get(key);
+  if (!raw) return null;
+  const { text, encrypted } = await decryptText(raw, env);
+  if (!encrypted) {
+    try {
+      await kvPutEncrypted(env, key, text);
+    } catch (error) {
+      console.error(JSON.stringify({ level: "warn", message: "明文迁移加密失败", error: error.message }));
+    }
+  }
+  return text;
+}
+
+/** 对外展示用：把路径段和 token 参数打码，避免订阅地址泄漏到日志/截屏。 */
+function maskSecretUrl(value) {
+  if (!value) return "";
+  try {
+    const u = new URL(value);
+    u.pathname = "/" + u.pathname.split("/").filter(Boolean)
+      .map((seg) => (seg.length > 6 ? `${seg.slice(0, 4)}****` : "****"))
+      .join("/");
+    for (const k of [...u.searchParams.keys()]) u.searchParams.set(k, "****");
+    return u.toString();
+  } catch {
+    return "****";
+  }
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -122,7 +207,7 @@ export default {
 
 async function loadSettings(env) {
   if (!env.PROFILES) return null;
-  const raw = await env.PROFILES.get(SETTINGS_KEY);
+  const raw = await kvGetDecrypted(env, SETTINGS_KEY);
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -133,14 +218,18 @@ async function loadSettings(env) {
 
 async function handleGetSettings(request, env) {
   requireToken(request, env);
+  // 默认打码；管理页传 reveal=1 才返回明文（页面需要回填输入框）
+  const reveal = new URL(request.url).searchParams.get("reveal") === "1";
   const settings = await loadSettings(env);
   const nodes = await readNodes(env);
+  const urls = resolveSubscriptionUrls(settings, env);
   return json({
     config: settings?.config || env.CONFIG_URL || DEFAULT_CONFIG_URL,
-    urls: resolveSubscriptionUrls(settings, env),
-    url: settings?.url || "",
+    urls: reveal ? urls : urls.map(maskSecretUrl),
+    url: reveal ? settings?.url || "" : maskSecretUrl(settings?.url),
     name: await resolveProfileName(env, settings),
     updatedAt: settings?.updatedAt || null,
+    encrypted: true,
     nodes: nodes ? { count: nodes.count, updatedAt: nodes.updatedAt } : null,
   });
 }
@@ -163,12 +252,13 @@ async function handleSaveSettings(request, env) {
   const name = typeof body.name === "string" ? body.name.trim().slice(0, 60) : "";
   const updatedAt = new Date().toISOString();
 
-  await env.PROFILES.put(
+  await kvPutEncrypted(
+    env,
     SETTINGS_KEY,
     JSON.stringify({ url: urls[0], urls, config: configUrl, name, updatedAt }),
   );
 
-  return json({ ok: true, config: configUrl, urls, name: name || undefined, updatedAt });
+  return json({ ok: true, config: configUrl, urls: urls.map(maskSecretUrl), name: name || undefined, updatedAt });
 }
 
 async function handleDeleteSettings(request, env) {
@@ -426,7 +516,7 @@ async function handleProvider(request, env, ctx) {
 
 async function readNodes(env) {
   if (!env.PROFILES) return null;
-  const raw = await env.PROFILES.get(NODES_KEY);
+  const raw = await kvGetDecrypted(env, NODES_KEY);
   if (!raw) return null;
   try {
     const record = JSON.parse(raw);
@@ -512,7 +602,7 @@ async function refreshNodes(env) {
     count: unique.length,
     updatedAt: new Date().toISOString(),
   };
-  await env.PROFILES.put(NODES_KEY, JSON.stringify(record));
+  await kvPutEncrypted(env, NODES_KEY, JSON.stringify(record));
   return record;
 }
 
@@ -1207,7 +1297,7 @@ function infoPage(env, request) {
     if (!token()) { setStatus("先填 ACCESS_TOKEN", "error"); return; }
     setStatus("读取中…");
     try {
-      var response = await fetch("/api/settings", { headers: { authorization: "Bearer " + token() } });
+      var response = await fetch("/api/settings?reveal=1", { headers: { authorization: "Bearer " + token() } });
       var data = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
       configInput.value = data.config || "";
@@ -1228,7 +1318,7 @@ function infoPage(env, request) {
     saveButton.disabled = true;
     setStatus("保存中…");
     try {
-      var response = await fetch("/api/settings", {
+      var response = await fetch("/api/settings?reveal=1", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer " + token() },
         body: JSON.stringify({
@@ -1252,7 +1342,7 @@ function infoPage(env, request) {
   async function clear() {
     if (!token()) { setStatus("先填 ACCESS_TOKEN", "error"); return; }
     try {
-      var response = await fetch("/api/settings", {
+      var response = await fetch("/api/settings?reveal=1", {
         method: "DELETE",
         headers: { authorization: "Bearer " + token() },
       });
