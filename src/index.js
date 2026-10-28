@@ -132,7 +132,16 @@ async function kvPutEncrypted(env, key, text) {
 async function kvGetDecrypted(env, key) {
   const raw = await env.PROFILES.get(key);
   if (!raw) return null;
-  const { text, encrypted } = await decryptText(raw, env);
+  let text;
+  let encrypted;
+  try {
+    ({ text, encrypted } = await decryptText(raw, env));
+  } catch (error) {
+    // 密钥换过导致旧密文解不开：当数据不存在并清掉，等用户重新保存
+    console.error(JSON.stringify({ level: "warn", message: "密文解密失败，忽略该键", key, error: maskError(error) }));
+    await env.PROFILES.delete(key).catch(() => {});
+    return null;
+  }
   if (!encrypted) {
     try {
       await kvPutEncrypted(env, key, text);
